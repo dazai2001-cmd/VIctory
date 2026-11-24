@@ -68,6 +68,7 @@ pub struct Bools {
 
 /// The tables below have small integer keys; SipHash dominated run time.
 type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
+type ImpossibleConjunctions = HashSet<Vec<(Bool, bool)>, BuildHasherDefault<Fx>>;
 
 /// FxHash's multiply-rotate step.
 #[derive(Default)]
@@ -228,22 +229,31 @@ impl Bools {
     /// too large to finish.
     pub fn meet(&self, all: &[(Bool, bool)]) -> bool {
         let mut budget = MAX_MEET;
-        self.meet_in(all.to_vec(), &mut budget)
+        let mut impossible = ImpossibleConjunctions::default();
+        self.meet_in(all.to_vec(), &mut budget, &mut impossible)
     }
 
-    fn meet_in(&self, mut all: Vec<(Bool, bool)>, budget: &mut usize) -> bool {
+    fn meet_in(
+        &self,
+        mut all: Vec<(Bool, bool)>,
+        budget: &mut usize,
+        impossible: &mut ImpossibleConjunctions,
+    ) -> bool {
         let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
         if all.iter().any(fails) {
             return false;
         }
         all.retain(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE);
+        if impossible.contains(&all) {
+            return false;
+        }
         if all.is_empty() || *budget == 0 {
             return true;
         }
         *budget -= 1;
         let top = |b: Bool| self.nodes[b.0 as usize].0;
         let v = all.iter().map(|&(b, _)| top(b)).min().expect("not empty");
-        [false, true].into_iter().any(|value| {
+        let possible = [false, true].into_iter().any(|value| {
             let next = all
                 .iter()
                 .map(|&(b, holds)| {
@@ -251,8 +261,14 @@ impl Bools {
                     (if value { hi } else { lo }, holds)
                 })
                 .collect();
-            self.meet_in(next, budget)
-        })
+            self.meet_in(next, budget, impossible)
+        });
+        // Different assignments to earlier atoms can leave the same
+        // cofactors. Only cache a contradiction when both cases fail.
+        if !possible {
+            impossible.insert(all);
+        }
+        possible
     }
 
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
@@ -1110,6 +1126,24 @@ mod tests {
 
     fn guarded(s: &Structured) -> usize {
         s.guards.iter().flatten().filter(|g| g.is_some()).count()
+    }
+
+    #[test]
+    fn repeated_lane_paths_do_not_hide_a_contradiction() {
+        let mut bools = Bools::new();
+        // Many ways to reach a block leave only two distinct parity states.
+        let mut reach = Bool::FALSE;
+        for i in 0..18 {
+            let condition = bools.atom(Atom::Lane(Value(i)), 0);
+            reach = bools.xor(reach, condition);
+        }
+        let a = bools.atom(Atom::Lane(Value(18)), 1);
+        let b = bools.atom(Atom::Lane(Value(19)), 1);
+        let different = bools.xor(a, b);
+        let both = bools.and(a, b);
+
+        assert!(bools.meet(&[(reach, true), (different, true), (both, false)]));
+        assert!(!bools.meet(&[(reach, true), (different, true), (both, true)]));
     }
 
     #[test]
